@@ -1420,30 +1420,62 @@ function prettyDate(d){ var p=String(d||'').split('-'); if(p.length!==3) return 
 function shortDate(d){ var p=String(d||'').split('-'); if(p.length!==3) return d||''; var m=parseInt(p[1],10); return parseInt(p[2],10)+' '+(MONTHS[m-1]||p[1]); }
 function byDate(a,b){ return String(a.date||a).localeCompare(String(b.date||b)); }
 
-/* ---- storage: cross-session window.storage (shared) → localStorage → memory ---- */
+/* ===========================================================================
+   >>> PASTE YOUR GOOGLE SHEET WEB APP URL BELOW (Apps Script ▸ Deploy ▸ Web app) <<<
+   Looks like: https://script.google.com/macros/s/AKfy....../exec
+   Leave the placeholder to keep saving on THIS computer only (not shared).
+=========================================================================== */
+var SHEET_API='https://script.google.com/macros/s/AKfycbwj2YjUEF4FEEyX02QelZsKNENmvDGBzw5klIZSPd0hTz4bD-4gLKuvAaoKrxULme9e/exec';
+var SHEET_TOKEN='wis-he-2026-shared-key';   // must match SECRET in the Apps Script
+function sheetReady(){ return /^https:\/\/script\.google\.com\/macros\//.test(SHEET_API); }
+
+/* ---- storage: Google Sheet (shared, for saved weeks) → localStorage (this device) ---- */
 var DB = (function(){
   var mem={};
-  var hasWS = (typeof window!=='undefined' && window.storage && typeof window.storage.get==='function');
   var hasLS = (function(){ try{ var k='__wis_probe'; window.localStorage.setItem(k,'1'); window.localStorage.removeItem(k); return true; }catch(e){ return false; } })();
+  // local fallback
+  function lget(key){ if(hasLS){ try{ var v=window.localStorage.getItem(key); return v!=null? JSON.parse(v): null; }catch(e){ return null; } } return (key in mem)? mem[key]:null; }
+  function lset(key,val){ if(hasLS){ try{ window.localStorage.setItem(key, JSON.stringify(val)); return true; }catch(e){} } mem[key]=val; return true; }
+  function ldel(key){ if(hasLS){ try{ window.localStorage.removeItem(key); }catch(e){} } delete mem[key]; }
+  // Google Sheet via Apps Script: JSONP for reads, POST for writes
+  var jid=0;
+  function jsonp(params){
+    return new Promise(function(resolve,reject){
+      var cb='__wiscb_'+(++jid), s=document.createElement('script'), done=false;
+      window[cb]=function(d){ done=true; resolve(d); cleanup(); };
+      function cleanup(){ try{ delete window[cb]; }catch(e){ window[cb]=undefined; } if(s.parentNode) s.parentNode.removeChild(s); clearTimeout(tm); }
+      var tm=setTimeout(function(){ if(!done){ cleanup(); reject(new Error('timeout')); } }, 20000);
+      s.onerror=function(){ cleanup(); reject(new Error('network')); };
+      var q=[]; for(var k in params){ q.push(encodeURIComponent(k)+'='+encodeURIComponent(params[k])); } q.push('callback='+cb);
+      s.src=SHEET_API+'?'+q.join('&'); document.head.appendChild(s);
+    });
+  }
+  function post(payload){
+    payload.token=SHEET_TOKEN; var body=JSON.stringify(payload);
+    return fetch(SHEET_API,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:body,redirect:'follow'})
+      .then(function(r){ return r.json().catch(function(){ return {ok:true}; }); })
+      .catch(function(){ return fetch(SHEET_API,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain;charset=utf-8'},body:body}).then(function(){ return {ok:true}; }); });
+  }
+  function isWeek(key){ return key.indexOf('wis_week__')===0; }
+  function isIndex(key){ return key.indexOf('wis_weeks__')===0; }
   async function get(key, shared){
-    shared = shared!==false;
-    if(hasWS){ try{ var r=await window.storage.get(key, shared); return (r && r.value!=null)? JSON.parse(r.value): null; }catch(e){ return null; } }
-    if(hasLS){ try{ var v=window.localStorage.getItem(key); return v!=null? JSON.parse(v): null; }catch(e){ return null; } }
-    return (key in mem)? mem[key] : null;
+    if(sheetReady() && isIndex(key)){ try{ var arr=await jsonp({action:'list', slug:key.slice('wis_weeks__'.length)}); return Array.isArray(arr)? arr : []; }catch(e){ return []; } }
+    if(sheetReady() && isWeek(key)){ try{ var w=await jsonp({action:'get', key:key}); return w||null; }catch(e){ return null; } }
+    return lget(key);
   }
   async function set(key, val, shared){
-    shared = shared!==false; var s=JSON.stringify(val);
-    if(hasWS){ try{ await window.storage.set(key, s, shared); return true; }catch(e){} }
-    if(hasLS){ try{ window.localStorage.setItem(key, s); return true; }catch(e){} }
-    mem[key]=val; return true;
+    if(sheetReady() && isIndex(key)){ return true; } // index is derived from the rows — nothing to store
+    if(sheetReady() && isWeek(key)){
+      try{ await post({ action:'save', key:key, slug: wkSlug(val.workshop), date: val.date, label: val.label||'', saved_by: val.savedBy||'', saved_at: val.savedAt||Date.now(), total: val.total||0, attendance: val.attendanceRate||0, conversion: val.conversionRate||0, hasL2: !!val.hasL2, data: JSON.stringify(val) }); return true; }catch(e){ return false; }
+    }
+    return lset(key, val);
   }
   async function del(key, shared){
-    shared = shared!==false;
-    if(hasWS){ try{ await window.storage.delete(key, shared); }catch(e){} }
-    if(hasLS){ try{ window.localStorage.removeItem(key); }catch(e){} }
-    delete mem[key];
+    if(sheetReady() && isIndex(key)){ return; }
+    if(sheetReady() && isWeek(key)){ try{ await post({ action:'del', key:key }); }catch(e){} return; }
+    return ldel(key);
   }
-  return { get:get, set:set, del:del, backend: hasWS?'cloud':(hasLS?'local':'memory') };
+  return { get:get, set:set, del:del, backend: sheetReady()?'sheet':(hasLS?'local':'memory') };
 })();
 
 /* ---- shared state ---- */
@@ -1538,7 +1570,7 @@ function selectWorkshop(name){
   currentWorkshop=name;
   $('wkGate').style.display='none';
   $('appContainer').style.display='block';
-  var bl={cloud:'shared workspace · synced',local:'this browser',memory:'session only · not saved'}[DB.backend]||'this browser';
+  var bl={sheet:'shared · Google Sheet',local:'this browser only',memory:'session only · not saved'}[DB.backend]||'this browser only';
   $('backendChip').textContent='⛁ '+bl;
   if(currentUser){
     $('userbox').innerHTML='<span class="wk-chip" id="wkChip">▦ '+escH(currentWorkshop)+' · change</span>'+
