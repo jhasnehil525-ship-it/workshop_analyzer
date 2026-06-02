@@ -1419,6 +1419,7 @@ var MONTHS=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','D
 function prettyDate(d){ var p=String(d||'').split('-'); if(p.length!==3) return d||''; var m=parseInt(p[1],10); return parseInt(p[2],10)+' '+(MONTHS[m-1]||p[1])+' '+p[0]; }
 function shortDate(d){ var p=String(d||'').split('-'); if(p.length!==3) return d||''; var m=parseInt(p[1],10); return parseInt(p[2],10)+' '+(MONTHS[m-1]||p[1]); }
 function byDate(a,b){ return String(a.date||a).localeCompare(String(b.date||b)); }
+function normYmd(d){ if(d==null) return ''; var s=String(d); if(/^\d{4}-\d{2}-\d{2}$/.test(s)) return s; var dt=new Date(s); if(isNaN(dt.getTime())) return s; var m=dt.getMonth()+1, day=dt.getDate(); return dt.getFullYear()+'-'+(m<10?'0':'')+m+'-'+(day<10?'0':'')+day; }
 
 /* ===========================================================================
    >>> PASTE YOUR GOOGLE SHEET WEB APP URL BELOW (Apps Script ▸ Deploy ▸ Web app) <<<
@@ -1654,7 +1655,7 @@ function computeSummary(date, label){
 }
 
 /* ---- SAVE / LIST / DELETE ---- */
-async function listWeeks(){ var idx=await DB.get(idxKey(), true); return Array.isArray(idx)? idx : []; }
+async function listWeeks(){ var idx=await DB.get(idxKey(), true); if(!Array.isArray(idx)) return []; idx.forEach(function(w){ if(w && w.date!=null) w.date=normYmd(w.date); }); return idx; }
 
 async function saveCurrentWeek(){
   var msg=$('saveMsg'); msg.className='save-msg'; msg.textContent='';
