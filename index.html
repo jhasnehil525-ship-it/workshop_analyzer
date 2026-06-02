@@ -416,6 +416,7 @@ tbody tr:hover td{background:var(--surface2);color:var(--text)}
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"></script>
 <script>
 "use strict";
 
@@ -1420,6 +1421,22 @@ function prettyDate(d){ var p=String(d||'').split('-'); if(p.length!==3) return 
 function shortDate(d){ var p=String(d||'').split('-'); if(p.length!==3) return d||''; var m=parseInt(p[1],10); return parseInt(p[2],10)+' '+(MONTHS[m-1]||p[1]); }
 function byDate(a,b){ return String(a.date||a).localeCompare(String(b.date||b)); }
 function normYmd(d){ if(d==null) return ''; var s=String(d); if(/^\d{4}-\d{2}-\d{2}$/.test(s)) return s; var dt=new Date(s); if(isNaN(dt.getTime())) return s; var m=dt.getMonth()+1, day=dt.getDate(); return dt.getFullYear()+'-'+(m<10?'0':'')+m+'-'+(day<10?'0':'')+day; }
+/* ---- full-report archive helpers (gzip + base64) ---- */
+function u8ToB64(u8){ var CHUNK=0x8000, parts=[]; for(var i=0;i<u8.length;i+=CHUNK){ parts.push(String.fromCharCode.apply(null, u8.subarray(i, i+CHUNK))); } return btoa(parts.join('')); }
+function b64ToU8(b64){ var bin=atob(b64), u8=new Uint8Array(bin.length); for(var i=0;i<bin.length;i++) u8[i]=bin.charCodeAt(i); return u8; }
+function gzipB64(str){ return u8ToB64(pako.gzip(str)); }
+function ungzipB64(b64){ return pako.ungzip(b64ToU8(b64), {to:'string'}); }
+// rebuild the exact analysis workbook from a stored OUT map (same sheets/order as "Download Everything")
+function workbookFromOUT(out){
+  var wb=XLSX.utils.book_new();
+  var known={ 'master_enriched_leads.csv':'Master Leads','leads_with_time_in_session.csv':'Time in Session','l1_with_paid_status.csv':'Paid Status','age_wise_bifurcation.csv':'Age Bifurcation','salary_city_enriched_leads.csv':'Salary+City Leads','salary_bifurcation.csv':'Salary Bifurcation','city_tier_bifurcation.csv':'City Tier Bifurcation','attendance_full_matrix.csv':'Attendance Matrix' };
+  var order=['master_enriched_leads.csv','leads_with_time_in_session.csv','l1_with_paid_status.csv','age_wise_bifurcation.csv','salary_city_enriched_leads.csv','salary_bifurcation.csv','city_tier_bifurcation.csv','attendance_full_matrix.csv'];
+  var used={};
+  function add(key, nm){ var aoa=out[key]; if(!aoa) return; nm=String(nm).slice(0,31); if(used[nm]) nm=nm.slice(0,28)+(Math.floor(Math.random()*99)); used[nm]=1; XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(aoa), nm); }
+  order.forEach(function(k){ if(out[k]) add(k, known[k]); });
+  Object.keys(out).forEach(function(k){ if(known[k]) return; if(k.indexOf('_retention.csv')>=0) add(k,'Retention'); else if(k.slice(-4)==='.csv' && k.indexOf('full_matrix')<0) add(k,'Attendance Table'); });
+  return wb;
+}
 
 /* ===========================================================================
    >>> PASTE YOUR GOOGLE SHEET WEB APP URL BELOW (Apps Script ▸ Deploy ▸ Web app) <<<
@@ -1476,7 +1493,10 @@ var DB = (function(){
     if(sheetReady() && isWeek(key)){ try{ await post({ action:'del', key:key }); }catch(e){} return; }
     return ldel(key);
   }
-  return { get:get, set:set, del:del, backend: sheetReady()?'sheet':(hasLS?'local':'memory') };
+  async function counts(){ if(sheetReady()){ try{ var m=await jsonp({action:'counts'}); return m||{}; }catch(e){ return {}; } } return {}; }
+  async function reportSave(key, b64){ if(sheetReady()){ try{ await post({action:'saveblob', key:key, b64:b64}); return true; }catch(e){ return false; } } try{ window.localStorage.setItem('wis_blob__'+key, b64); return true; }catch(e){ return false; } }
+  async function reportGet(key){ if(sheetReady()){ try{ var s=await jsonp({action:'getblob', key:key}); return s||''; }catch(e){ return ''; } } try{ return window.localStorage.getItem('wis_blob__'+key)||''; }catch(e){ return ''; } }
+  return { get:get, set:set, del:del, counts:counts, reportSave:reportSave, reportGet:reportGet, backend: sheetReady()?'sheet':(hasLS?'local':'memory') };
 })();
 
 /* ---- shared state ---- */
@@ -1558,14 +1578,17 @@ function renderWorkshopGrid(){
     return '<button class="wk-card" data-wk="'+escH(w)+'"><div class="nm">'+escH(w)+'</div><div class="ct" id="wkct_'+wkSlug(w)+'">…</div></button>';
   }).join('');
   g.querySelectorAll('[data-wk]').forEach(function(b){ b.addEventListener('click', function(){ selectWorkshop(b.getAttribute('data-wk')); }); });
-  // show how many weeks are saved per workshop
-  WORKSHOPS.forEach(function(w){
-    var prev=currentWorkshop; currentWorkshop=w;
-    listWeeks().then(function(saved){
-      var el=$('wkct_'+wkSlug(w)); if(el) el.textContent=(saved.length||0)+' saved week'+(saved.length===1?'':'s');
+  // show how many weeks are saved per workshop — one batched call when shared, else local count
+  function paint(map){ WORKSHOPS.forEach(function(w){ var el=$('wkct_'+wkSlug(w)); if(el){ var n=(map&&map[wkSlug(w)])||0; el.textContent=n+' saved week'+(n===1?'':'s'); } }); }
+  if(sheetReady()){
+    DB.counts().then(paint).catch(function(){ paint({}); });
+  } else {
+    WORKSHOPS.forEach(function(w){
+      var prev=currentWorkshop; currentWorkshop=w;
+      listWeeks().then(function(saved){ var el=$('wkct_'+wkSlug(w)); if(el) el.textContent=(saved.length||0)+' saved week'+(saved.length===1?'':'s'); });
+      currentWorkshop=prev;
     });
-    currentWorkshop=prev;
-  });
+  }
 }
 function selectWorkshop(name){
   currentWorkshop=name;
@@ -1663,7 +1686,20 @@ async function saveCurrentWeek(){
   var date = ($('saveDate').value || ($('meetDate')? $('meetDate').value:'') || '').trim();
   if(!date){ msg.className='save-msg err'; msg.textContent='Pick the workshop date for this week.'; return; }
   var label=String($('saveLabel').value||'').trim();
+  msg.className='save-msg'; msg.textContent='Saving…';
   var summary=computeSummary(date, label);
+  // archive the FULL report (every per-attendee sheet) so saved data downloads identically later
+  var reportNote='', reportOK=false;
+  try{
+    var out=window.OUT||{};
+    if(typeof pako==='undefined'){ reportNote=' (full report not archived — report library still loading, try again in a moment)'; }
+    else if(Object.keys(out).length){
+      var b64=gzipB64(JSON.stringify(out));
+      if(b64.length > 9000000){ reportNote=' (this week is very large, so only the summary was archived — re-run analysis to get the full per-attendee file)'; }
+      else { reportOK=await DB.reportSave(weekKey(date), b64); if(!reportOK) reportNote=' (full report could not be archived this time)'; }
+    }
+  }catch(e){ reportNote=' (full report could not be archived: '+e.message+')'; }
+  summary.hasReport=reportOK;
   await DB.set(weekKey(date), summary, true);
   var idx=await listWeeks();
   idx=idx.filter(function(w){ return w.date!==date; });
@@ -1671,7 +1707,7 @@ async function saveCurrentWeek(){
              total:summary.total, attendanceRate:summary.attendanceRate, conversionRate:summary.conversionRate, hasL2:summary.hasL2 });
   idx.sort(byDate);
   await DB.set(idxKey(), idx, true);
-  msg.className='save-msg'; msg.textContent='✓ Saved '+prettyDate(date)+' to the library ('+idx.length+' week'+(idx.length>1?'s':'')+' stored). Open Compare to analyze it against others.';
+  msg.className='save-msg'; msg.textContent='✓ Saved '+prettyDate(date)+' to the library ('+idx.length+' week'+(idx.length>1?'s':'')+' stored)'+(reportOK?' with the full report':'')+'.'+reportNote;
 }
 
 async function deleteWeek(date){
@@ -1703,7 +1739,7 @@ async function renderLibrary(){
         '<div class="lib-metric"><div class="v" style="color:var(--accent2)">'+fmtPct(w.attendanceRate)+'</div><div class="k">Attended</div></div>'+
         '<div class="lib-metric"><div class="v" style="color:var(--accent4)">'+(w.hasL2?fmtPct(w.conversionRate):'—')+'</div><div class="k">L2 Conv</div></div>'+
       '</div>'+
-      '<div class="lib-actions"><button data-cmp="'+escH(w.date)+'">⇄ Use in compare</button><button data-dl="'+escH(w.date)+'">⬇ Excel</button><button class="del" data-del="'+escH(w.date)+'">🗑 Delete</button></div>'+
+      '<div class="lib-actions"><button data-cmp="'+escH(w.date)+'">⇄ Use in compare</button><button data-dl="'+escH(w.date)+'">⬇ Download (Excel)</button><button class="del" data-del="'+escH(w.date)+'">🗑 Delete</button></div>'+
     '</div>';
   }).join('');
   box.querySelectorAll('[data-del]').forEach(function(b){ b.addEventListener('click', function(){ if(confirm('Delete '+prettyDate(b.getAttribute('data-del'))+' from the library?')) deleteWeek(b.getAttribute('data-del')); }); });
@@ -1910,7 +1946,17 @@ function weekToWorkbook(s){
   if(s.priceReveal){ var pr=[['At price reveal ('+s.priceReveal.time+')','Present','Total','Present %']]; pr.push(['Overall',s.priceReveal.presentTotal,s.total,(s.priceReveal.presentRate*100).toFixed(1)]); pr.push(['','','','']); pr.push(['By salary','Present','Total','Present %']); SAL_KEYS.forEach(function(k){ var b=s.priceReveal.salary[k]||{n:0,present:0}; pr.push([SAL_LABEL[k]||k,b.present,b.n,b.n?(b.present/b.n*100).toFixed(1):'']); }); pr.push(['','','','']); pr.push(['By age','Present','Total','Present %']); Object.keys(s.priceReveal.age||{}).forEach(function(k){ var b=s.priceReveal.age[k]; pr.push([k,b.present,b.n,b.n?(b.present/b.n*100).toFixed(1):'']); }); XLSX.utils.book_append_sheet(wb,XLSX.utils.aoa_to_sheet(pr),'Price Reveal'); }
   return wb;
 }
-async function downloadWeek(date){ if(typeof XLSX==='undefined'){ alert('Excel library not loaded.'); return; } var s=await DB.get(weekKey(date), true); if(!s){ alert('Could not load that week.'); return; } XLSX.writeFile(weekToWorkbook(s), wkSlug(currentWorkshop)+'_'+date+'.xlsx'); }
+async function downloadWeek(date){
+  if(typeof XLSX==='undefined'){ alert('Excel library not loaded.'); return; }
+  var s=await DB.get(weekKey(date), true); if(!s){ alert('Could not load that week.'); return; }
+  if(s.hasReport && typeof pako!=='undefined'){
+    try{
+      var b64=await DB.reportGet(weekKey(date));
+      if(b64){ var out=JSON.parse(ungzipB64(b64)); XLSX.writeFile(workbookFromOUT(out), wkSlug(currentWorkshop)+'_'+date+'_full.xlsx'); return; }
+    }catch(e){ /* fall through to the summary workbook */ }
+  }
+  XLSX.writeFile(weekToWorkbook(s), wkSlug(currentWorkshop)+'_'+date+'.xlsx');
+}
 async function exportAllWeeks(){ if(typeof XLSX==='undefined'){ alert('Excel library not loaded.'); return; } var idx=await listWeeks(); if(!idx.length){ alert('No saved weeks yet for '+currentWorkshop+'.'); return; } var weeks=[]; for(var i=0;i<idx.length;i++){ var s=await DB.get(weekKey(idx[i].date),true); if(s) weeks.push(s); } weeks.sort(byDate); XLSX.writeFile(buildWeeksWorkbook(weeks,null), wkSlug(currentWorkshop)+'_all_weeks.xlsx'); }
 async function exportBackup(){ var idx=await listWeeks(); var data={app:'workshop-intelligence', workshop:currentWorkshop, exportedAt:new Date().toISOString(), index:idx, weeks:{}}; for(var i=0;i<idx.length;i++){ data.weeks[idx[i].date]=await DB.get(weekKey(idx[i].date), true); } var blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'}); var url=URL.createObjectURL(blob), a=document.createElement('a'); a.href=url; a.download='workshop_'+wkSlug(currentWorkshop)+'_backup.json'; a.click(); URL.revokeObjectURL(url); }
 function importBackup(){ var inp=document.createElement('input'); inp.type='file'; inp.accept='.json,application/json'; inp.onchange=function(){ var f=inp.files&&inp.files[0]; if(!f) return; var rd=new FileReader(); rd.onload=function(){ (async function(){ try{ var data=JSON.parse(rd.result); if(!data || !data.index){ alert('That file is not a valid backup.'); return; } for(var d in data.weeks){ await DB.set(weekKey(d), data.weeks[d], true); } var cur=await listWeeks(); var byd={}; cur.forEach(function(w){byd[w.date]=w;}); data.index.forEach(function(w){byd[w.date]=w;}); var merged=Object.keys(byd).map(function(k){return byd[k];}).sort(byDate); await DB.set(idxKey(), merged, true); renderLibrary(); alert('Restored '+data.index.length+' week(s) into '+currentWorkshop+'.'); }catch(e){ alert('Could not read backup: '+e.message); } })(); }; rd.readAsText(f); }; inp.click(); }
